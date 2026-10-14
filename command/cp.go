@@ -122,6 +122,10 @@ Examples:
 
 func NewSharedFlags() []cli.Flag {
 	return []cli.Flag{
+		&cli.StringFlag{
+			Name:  "state-file",
+			Usage: "path to state file for pause/resume multipart transfers",
+		},
 		&cli.BoolFlag{
 			Name:  "no-follow-symlinks",
 			Usage: "do not follow symbolic links",
@@ -652,6 +656,11 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
+			if srcObj, sErr := statObject(ctx, srcurl, srcClient); sErr == nil && srcObj != nil {
+				if c.progressbar != nil {
+					c.progressbar.AddCompletedBytes(srcObj.Size)
+				}
+			}
 			return nil
 		}
 		return err
@@ -659,6 +668,28 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 
 	dstPath := filepath.Dir(dsturl.Absolute())
 	dstFile := filepath.Base(dsturl.Absolute())
+
+	if c.storageOpts.StateFile != "" {
+		size, err := srcClient.ResumableGet(ctx, srcurl, dsturl.Absolute(), c.concurrency, c.partSize, c.progressbar)
+		if err != nil {
+			return err
+		}
+		if c.deleteSource {
+			_ = srcClient.Delete(ctx, srcurl)
+		}
+		if !c.showProgress {
+			msg := log.InfoMessage{
+				Operation:   c.op,
+				Source:      srcurl,
+				Destination: dsturl,
+				Object: &storage.Object{
+					Size: size,
+				},
+			}
+			log.Info(msg)
+		}
+		return nil
+	}
 	file, err := dstClient.CreateTemp(dstPath, dstFile)
 	if err != nil {
 		return err
@@ -713,6 +744,11 @@ func (c Copy) doUpload(ctx context.Context, srcurl *url.URL, dsturl *url.URL, ex
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
+			if srcObj, sErr := statObject(ctx, srcurl, srcClient); sErr == nil && srcObj != nil {
+				if c.progressbar != nil {
+					c.progressbar.AddCompletedBytes(srcObj.Size)
+				}
+			}
 			return nil
 		}
 		return err
@@ -1137,4 +1173,14 @@ func (r *countingReaderWriter) ReadAt(p []byte, off int64) (int, error) {
 
 func (r *countingReaderWriter) Seek(offset int64, whence int) (int64, error) {
 	return r.fp.Seek(offset, whence)
+}
+
+func (r *countingReaderWriter) File() *os.File {
+	return r.fp
+}
+
+func (r *countingReaderWriter) AddCompletedBytes(n int64) {
+	if r.pb != nil {
+		r.pb.AddCompletedBytes(n)
+	}
 }

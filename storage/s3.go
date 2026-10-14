@@ -68,6 +68,7 @@ type S3 struct {
 	useListObjectsV1       bool
 	noSuchUploadRetryCount int
 	requestPayer           string
+	stateFile              string
 }
 
 func (s *S3) RequestPayer() *string {
@@ -111,6 +112,7 @@ func newS3Storage(ctx context.Context, opts Options) (*S3, error) {
 		useListObjectsV1:       opts.UseListObjectsV1,
 		requestPayer:           opts.RequestPayer,
 		noSuchUploadRetryCount: opts.NoSuchUploadRetryCount,
+		stateFile:              opts.StateFile,
 	}, nil
 }
 
@@ -801,6 +803,10 @@ func (s *S3) Put(
 ) error {
 	if s.dryRun {
 		return nil
+	}
+
+	if s.stateFile != "" {
+		return s.ResumablePut(ctx, reader, to, metadata, concurrency, partSize)
 	}
 
 	contentType := metadata.ContentType

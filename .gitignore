@@ -2,5 +2,7 @@
 .vscode/
 /s5cmd
 /s5cmd.exe
+/s5cmd_*
+__pycache__/
 /*.iml
 .DS_Store
