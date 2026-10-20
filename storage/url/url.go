@@ -204,8 +204,14 @@ func (u *URL) Join(s string) *URL {
 	clone := u.Clone()
 	if !clone.IsRemote() {
 		// URL is local, thus clean the path by using path.Join which
-		// removes adjacent slashes.
+		// removes adjacent slashes. A Windows UNC path ("//server/share/...") must keep its leading
+		// double slash: path.Join would turn it into "/server/share/...", i.e. a folder on the current
+		// drive, silently writing downloads to the wrong place.
+		unc := runtime.GOOS == "windows" && strings.HasPrefix(clone.Path, "//") && !strings.HasPrefix(clone.Path, "///")
 		clone.Path = path.Join(clone.Path, s)
+		if unc && !strings.HasPrefix(clone.Path, "//") {
+			clone.Path = "/" + clone.Path
+		}
 		return clone
 	}
 	// URL is remote, keep them as it is and join using string.Join which

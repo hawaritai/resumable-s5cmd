@@ -10,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/urfave/cli/v2"
@@ -261,6 +263,10 @@ func NewCopyCommandFlags() []cli.Flag {
 			Aliases: []string{"sp"},
 			Usage:   "show a progress bar",
 		},
+		&cli.BoolFlag{
+			Name:  "progress-json",
+			Usage: "emit exact progress as a JSON line on stdout every 500ms (for orchestrators; replaces the text bar)",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(copyFlags, sharedFlags...)
@@ -362,7 +368,9 @@ func NewCopy(c *cli.Context, deleteSource bool) (*Copy, error) {
 
 	var commandProgressBar progressbar.ProgressBar
 
-	if c.Bool("show-progress") && !(src.Type == dst.Type) {
+	if c.Bool("progress-json") && !(src.Type == dst.Type) {
+		commandProgressBar = progressbar.NewJSON(500 * time.Millisecond)
+	} else if c.Bool("show-progress") && !(src.Type == dst.Type) {
 		commandProgressBar = progressbar.New()
 	} else {
 		commandProgressBar = &progressbar.NoOp{}
@@ -404,7 +412,7 @@ func NewCopy(c *cli.Context, deleteSource bool) (*Copy, error) {
 		contentDisposition:    c.String("content-disposition"),
 		metadata:              metadata,
 		metadataDirective:     c.String("metadata-directive"),
-		showProgress:          c.Bool("show-progress"),
+		showProgress:          c.Bool("show-progress") || c.Bool("progress-json"),
 		progressbar:           commandProgressBar,
 
 		// region settings
@@ -566,10 +574,16 @@ func (c Copy) Run(ctx context.Context) error {
 		}
 		parallel.Run(task, waiter)
 	}
+	progressbar.ListingDone(c.progressbar) // all sources enumerated: totals are final
 	waiter.Wait()
 	<-errDoneCh
 
-	return multierror.Append(merrorWaiter, merrorObjects).ErrorOrNil()
+	err = multierror.Append(merrorWaiter, merrorObjects).ErrorOrNil()
+	if err == nil {
+		// Every object succeeded: the per-object completion records are no longer needed.
+		storage.ClearStateCompleted(c.storageOpts.StateFile)
+	}
+	return err
 }
 
 func (c Copy) prepareCopyTask(
@@ -652,13 +666,27 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 
 	dstClient := storage.NewLocalClient(c.storageOpts)
 
+	// Resume: an object this job already downloaded (same ETag and size, file still in place) is skipped.
+	if c.storageOpts.StateFile != "" {
+		key := storage.DownloadCompletedKey(srcurl.Absolute(), dsturl.Absolute())
+		if storage.StateHasCompleted(c.storageOpts.StateFile, key) {
+			if obj, sErr := statObject(ctx, srcurl, srcClient); sErr == nil && obj != nil {
+				if fi, fErr := os.Stat(dsturl.Absolute()); fErr == nil && fi.Size() == obj.Size &&
+					storage.StateCompleted(c.storageOpts.StateFile, key, obj.Size, `"`+obj.Etag+`"`) {
+					progressbar.AddSkipped(c.progressbar, obj.Size)
+					return nil
+				}
+			}
+		}
+	}
+
 	err = c.shouldOverride(ctx, srcurl, dsturl)
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
 			if srcObj, sErr := statObject(ctx, srcurl, srcClient); sErr == nil && srcObj != nil {
 				if c.progressbar != nil {
-					c.progressbar.AddCompletedBytes(srcObj.Size)
+					progressbar.AddSkipped(c.progressbar, srcObj.Size) // already at destination: completed, not transferred
 				}
 			}
 			return nil
@@ -740,13 +768,27 @@ func (c Copy) doUpload(ctx context.Context, srcurl *url.URL, dsturl *url.URL, ex
 	}
 	defer file.Close()
 
+	// Resume: an object this job already uploaded (same size and modification time) is not sent again,
+	// even in overwrite mode (job-plan semantics, as in AzCopy).
+	completedKey, srcVersion, srcSize := "", "", int64(0)
+	if c.storageOpts.StateFile != "" {
+		if fi, sErr := file.Stat(); sErr == nil {
+			completedKey = storage.UploadCompletedKey(srcurl.Absolute(), dsturl.Absolute())
+			srcVersion, srcSize = strconv.FormatInt(fi.ModTime().UnixNano(), 10), fi.Size()
+			if storage.StateCompleted(c.storageOpts.StateFile, completedKey, srcSize, srcVersion) {
+				progressbar.AddSkipped(c.progressbar, srcSize)
+				return nil
+			}
+		}
+	}
+
 	err = c.shouldOverride(ctx, srcurl, dsturl)
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
 			if srcObj, sErr := statObject(ctx, srcurl, srcClient); sErr == nil && srcObj != nil {
 				if c.progressbar != nil {
-					c.progressbar.AddCompletedBytes(srcObj.Size)
+					progressbar.AddSkipped(c.progressbar, srcObj.Size) // already at destination: completed, not transferred
 				}
 			}
 			return nil
@@ -786,6 +828,9 @@ func (c Copy) doUpload(ctx context.Context, srcurl *url.URL, dsturl *url.URL, ex
 
 	if err != nil {
 		return err
+	}
+	if completedKey != "" {
+		storage.MarkStateCompleted(c.storageOpts.StateFile, completedKey, srcSize, srcVersion)
 	}
 
 	obj, err := srcClient.Stat(ctx, srcurl)
@@ -1182,5 +1227,19 @@ func (r *countingReaderWriter) File() *os.File {
 func (r *countingReaderWriter) AddCompletedBytes(n int64) {
 	if r.pb != nil {
 		r.pb.AddCompletedBytes(n)
+	}
+}
+
+// AddResumedBytes reports bytes restored from a checkpoint (not transferred in this run).
+func (r *countingReaderWriter) AddResumedBytes(n int64) {
+	if r.pb != nil {
+		progressbar.AddResumed(r.pb, n)
+	}
+}
+
+// AddInflightBytes reports bytes of parts still being sent (negative to roll back).
+func (r *countingReaderWriter) AddInflightBytes(n int64) {
+	if r.pb != nil {
+		progressbar.AddInflight(r.pb, n)
 	}
 }

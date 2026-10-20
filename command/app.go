@@ -90,6 +90,14 @@ var app = &cli.App{
 			Name:  "credentials-file",
 			Usage: "use the specified credentials file instead of the default credentials file",
 		},
+		&cli.BoolFlag{
+			Name:  "credentials-stdin",
+			Usage: "read access key, secret key and optional session token from stdin (one per line) before running",
+		},
+		&cli.Float64Flag{
+			Name:  "rate-limit",
+			Usage: "limit the total transfer rate of this run in MiB/s, across all connections and both directions (0 = unlimited)",
+		},
 	},
 	Before: func(c *cli.Context) error {
 		retryCount := c.Int("retry-count")
@@ -116,6 +124,26 @@ var app = &cli.App{
 			err := fmt.Errorf(`"no-sign-request" and "credentials-file" flags cannot be used together`)
 			printError(commandFromContext(c), c.Command.Name, err)
 			return err
+		}
+
+		if c.Bool("credentials-stdin") {
+			if c.Bool("no-sign-request") || c.String("profile") != "" || c.String("credentials-file") != "" {
+				err := fmt.Errorf(`"credentials-stdin" cannot be used with "no-sign-request", "profile" or "credentials-file"`)
+				printError(commandFromContext(c), c.Command.Name, err)
+				return err
+			}
+			if err := loadCredentialsFromStdin(os.Stdin); err != nil {
+				printError(commandFromContext(c), c.Command.Name, err)
+				return err
+			}
+		}
+
+		if limit := c.Float64("rate-limit"); limit < 0 {
+			err := fmt.Errorf("rate limit cannot be a negative value")
+			printError(commandFromContext(c), c.Command.Name, err)
+			return err
+		} else {
+			storage.SetBandwidthLimit(int64(limit * 1024 * 1024))
 		}
 
 		if isStat {
@@ -166,6 +194,8 @@ var app = &cli.App{
 		return cli.ShowAppHelp(c)
 	},
 	After: func(c *cli.Context) error {
+		// Persist coalesced checkpoint updates (also reached on SIGINT/SIGTERM via context cancel).
+		storage.FlushStateStores()
 		if c.Bool("stat") && len(stat.Statistics()) > 0 {
 			log.Stat(stat.Statistics())
 		}
@@ -212,6 +242,8 @@ func Commands() []*cli.Command {
 		NewBucketVersionCommand(),
 		NewPresignCommand(),
 		NewHeadCommand(),
+		NewAbortCommand(),
+		NewCleanupUploadsCommand(),
 	}
 }
 

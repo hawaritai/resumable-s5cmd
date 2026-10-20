@@ -1,9 +1,11 @@
 module github.com/peak/s5cmd/v2
 
-go 1.20
+go 1.26.0
+
+toolchain go1.27.2
 
 require (
-	github.com/aws/aws-sdk-go v1.44.298
+	github.com/aws/aws-sdk-go v1.55.8
 	github.com/cheggaaa/pb/v3 v3.1.4
 	github.com/google/go-cmp v0.6.0
 	github.com/hashicorp/go-multierror v1.1.1
@@ -42,7 +44,7 @@ require (
 	golang.org/x/exp/typeparams v0.0.0-20221208152030-732eee02a75a // indirect
 	golang.org/x/mod v0.17.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.20.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/tools v0.21.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
 	gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce // indirect

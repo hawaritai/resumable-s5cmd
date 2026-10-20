@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"io"
 	"math"
 	"math/big"
-	"net/http"
 	urlpkg "net/url"
 	"os"
 	"strconv"
@@ -1271,10 +1269,7 @@ func (sc *SessionCache) newSession(ctx context.Context, opts Options) (*session.
 		endpointURL = sentinelURL
 	}
 
-	var httpClient *http.Client
-	if opts.NoVerifySSL {
-		httpClient = insecureHTTPClient
-	}
+	httpClient := newHTTPClient(opts.NoVerifySSL)
 	awsCfg = awsCfg.
 		WithEndpoint(endpointURL.String()).
 		WithS3ForcePathStyle(!isVirtualHostStyle).
@@ -1394,7 +1389,7 @@ func newCustomRetryer(maxRetries int) *customRetryer {
 // ShouldRetry overrides SDK's built in DefaultRetryer, adding custom retry
 // logics that are not included in the SDK.
 func (c *customRetryer) ShouldRetry(req *request.Request) bool {
-	shouldRetry := errHasCode(req.Error, "InternalError") || errHasCode(req.Error, "RequestTimeTooSkewed") || errHasCode(req.Error, "SlowDown") || strings.Contains(req.Error.Error(), "connection reset") || strings.Contains(req.Error.Error(), "connection timed out")
+	shouldRetry := errHasCode(req.Error, "InternalError") || errHasCode(req.Error, "RequestTimeTooSkewed") || errHasCode(req.Error, "SlowDown") || isTransientNetworkError(req.Error)
 	if !shouldRetry {
 		shouldRetry = c.DefaultRetryer.ShouldRetry(req)
 	}
@@ -1413,11 +1408,38 @@ func (c *customRetryer) ShouldRetry(req *request.Request) bool {
 	return shouldRetry
 }
 
-var insecureHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		Proxy:           http.ProxyFromEnvironment,
-	},
+// transientNetworkErrors are connection-level failures worth retrying, in the wording of every
+// platform s5cmd runs on (Windows reports a reset peer as "forcibly closed" / WSAECONNRESET).
+var transientNetworkErrors = []string{
+	"connection reset",
+	"connection timed out",
+	"forcibly closed by the remote host",
+	"connection was aborted",
+	"wsasend",
+	"wsarecv",
+	"broken pipe",
+	"use of closed network connection",
+	"unexpected eof",
+	"i/o timeout",
+	"tls handshake timeout",
+	"server closed idle connection",
+	"http2: server sent goaway",
+}
+
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range transientNetworkErrors {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func supportsTransferAcceleration(endpoint urlpkg.URL) bool {

@@ -385,7 +385,7 @@ func goBuildS5cmd() func() {
 
 	var args []string
 
-	if os.Getenv(testDisableRaceFlagKey) == testDisableRaceFlagVal {
+	if os.Getenv(testDisableRaceFlagKey) == testDisableRaceFlagVal || !raceDetectorAvailable() {
 		/*
 		 1. disable '-race' flag because CI fails with below error.
 
@@ -1098,6 +1098,17 @@ func match(expected string) compareFunc {
 func isJSON(str string) bool {
 	var js jsonpkg.RawMessage
 	return jsonpkg.Unmarshal([]byte(str), &js) == nil
+}
+
+// raceDetectorAvailable reports whether 'go build -race' can work here: the race detector needs cgo
+// (and a C compiler), which is off by default on Windows without gcc.
+func raceDetectorAvailable() bool {
+	out, err := exec.Command("go", "env", "CGO_ENABLED").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "1" {
+		fmt.Fprintln(os.Stderr, "e2e: cgo is not available, building s5cmd without -race")
+		return false
+	}
+	return true
 }
 
 func equals(format string, args ...interface{}) compareFunc {
