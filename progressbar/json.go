@@ -42,6 +42,53 @@ func AddInflight(pb ProgressBar, n int64) {
 	}
 }
 
+// Planner is implemented by reporters that show a check-first plan (cp --check-first).
+type Planner interface {
+	SetPhase(phase string)       // "listing", "checking", "transferring"
+	AddChecked(n int64)          // source objects compared with the destination
+	AddDestListed(n int64)       // destination objects listed for the comparison
+	AddSkippedObject(size int64) // one object already at the destination: completed without transfer
+	SetPlan()                    // the comparison is complete: the plan below is final
+}
+
+// SetPhase reports the current phase of a check-first copy.
+func SetPhase(pb ProgressBar, phase string) {
+	if p, ok := pb.(Planner); ok {
+		p.SetPhase(phase)
+	}
+}
+
+// AddChecked counts source objects compared with the destination.
+func AddChecked(pb ProgressBar, n int64) {
+	if p, ok := pb.(Planner); ok {
+		p.AddChecked(n)
+	}
+}
+
+// AddDestListed counts destination objects listed for the comparison.
+func AddDestListed(pb ProgressBar, n int64) {
+	if p, ok := pb.(Planner); ok {
+		p.AddDestListed(n)
+	}
+}
+
+// AddSkippedObject records one object found already at the destination by the plan.
+func AddSkippedObject(pb ProgressBar, size int64) {
+	if p, ok := pb.(Planner); ok {
+		p.AddSkippedObject(size)
+		return
+	}
+	AddSkipped(pb, size)
+	pb.IncrementCompletedObjects()
+}
+
+// PlanDone marks the plan of a check-first copy as final.
+func PlanDone(pb ProgressBar) {
+	if p, ok := pb.(Planner); ok {
+		p.SetPlan()
+	}
+}
+
 // ListingDone marks source enumeration as complete.
 func ListingDone(pb ProgressBar) {
 	if a, ok := pb.(Accounting); ok {
@@ -64,6 +111,17 @@ type JSONProgress struct {
 	inflightBytes    int64
 	listingDone      int32
 
+	// check-first plan
+	phase         atomic.Value // string
+	checked       int64
+	destListed    int64
+	skippedFiles  int64
+	planDone      int32
+	planSendFiles int64
+	planSendBytes int64
+	planSkipFiles int64
+	planSkipBytes int64
+
 	start    time.Time
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -73,6 +131,7 @@ type JSONProgress struct {
 var (
 	_ ProgressBar = (*JSONProgress)(nil)
 	_ Accounting  = (*JSONProgress)(nil)
+	_ Planner     = (*JSONProgress)(nil)
 )
 
 func NewJSON(interval time.Duration) *JSONProgress {
@@ -123,7 +182,28 @@ func (p *JSONProgress) AddResumedBytes(n int64) {
 }
 
 func (p *JSONProgress) AddInflightBytes(n int64) { atomic.AddInt64(&p.inflightBytes, n) }
-func (p *JSONProgress) SetListingDone()          { atomic.StoreInt32(&p.listingDone, 1) }
+
+func (p *JSONProgress) SetPhase(phase string) { p.phase.Store(phase) }
+func (p *JSONProgress) AddChecked(n int64)    { atomic.AddInt64(&p.checked, n) }
+func (p *JSONProgress) AddDestListed(n int64) { atomic.AddInt64(&p.destListed, n) }
+
+func (p *JSONProgress) AddSkippedObject(size int64) {
+	atomic.AddInt64(&p.skippedFiles, 1)
+	p.AddSkippedBytes(size)
+	p.IncrementCompletedObjects()
+}
+
+// SetPlan freezes the plan: everything listed minus what the comparison found already at the destination.
+func (p *JSONProgress) SetPlan() {
+	skipFiles := atomic.LoadInt64(&p.skippedFiles)
+	skipBytes := atomic.LoadInt64(&p.skippedBytes)
+	atomic.StoreInt64(&p.planSkipFiles, skipFiles)
+	atomic.StoreInt64(&p.planSkipBytes, skipBytes)
+	atomic.StoreInt64(&p.planSendFiles, atomic.LoadInt64(&p.totalObjects)-skipFiles)
+	atomic.StoreInt64(&p.planSendBytes, atomic.LoadInt64(&p.totalBytes)-skipBytes)
+	atomic.StoreInt32(&p.planDone, 1)
+}
+func (p *JSONProgress) SetListingDone() { atomic.StoreInt32(&p.listingDone, 1) }
 
 type progressLine struct {
 	Operation        string `json:"operation"`
@@ -138,6 +218,21 @@ type progressLine struct {
 	ListingDone      bool   `json:"listing_done"`
 	ElapsedMs        int64  `json:"elapsed_ms"`
 	Final            bool   `json:"final,omitempty"`
+
+	// check-first copies only
+	Phase        string    `json:"phase,omitempty"`
+	CheckedFiles int64     `json:"checked_files,omitempty"`
+	DestListed   int64     `json:"dest_listed,omitempty"`
+	SkippedFiles int64     `json:"skipped_files,omitempty"`
+	Plan         *planLine `json:"plan,omitempty"`
+}
+
+// planLine is the final plan of a check-first copy: what is sent, and what was already at the destination.
+type planLine struct {
+	SendFiles int64 `json:"send_files"`
+	SendBytes int64 `json:"send_bytes"`
+	SkipFiles int64 `json:"skip_files"`
+	SkipBytes int64 `json:"skip_bytes"`
 }
 
 // Snapshot returns the current counters (exported for tests).
@@ -158,7 +253,22 @@ func (p *JSONProgress) snapshot(final bool) progressLine {
 	if transferred < 0 {
 		transferred = 0
 	}
+	var plan *planLine
+	if atomic.LoadInt32(&p.planDone) == 1 {
+		plan = &planLine{
+			SendFiles: atomic.LoadInt64(&p.planSendFiles),
+			SendBytes: atomic.LoadInt64(&p.planSendBytes),
+			SkipFiles: atomic.LoadInt64(&p.planSkipFiles),
+			SkipBytes: atomic.LoadInt64(&p.planSkipBytes),
+		}
+	}
+	phase, _ := p.phase.Load().(string)
 	return progressLine{
+		Phase:            phase,
+		CheckedFiles:     atomic.LoadInt64(&p.checked),
+		DestListed:       atomic.LoadInt64(&p.destListed),
+		SkippedFiles:     atomic.LoadInt64(&p.skippedFiles),
+		Plan:             plan,
 		Operation:        "progress",
 		Bytes:            done,
 		TotalBytes:       total,

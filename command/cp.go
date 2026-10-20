@@ -267,6 +267,11 @@ func NewCopyCommandFlags() []cli.Flag {
 			Name:  "progress-json",
 			Usage: "emit exact progress as a JSON line on stdout every 500ms (for orchestrators; replaces the text bar)",
 		},
+		&cli.BoolFlag{
+			Name: "check-first",
+			Usage: "list the source and compare it with the destination in bulk before transferring, then send " +
+				"only what is needed (exact totals from the start; one listing instead of a request per file)",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(copyFlags, sharedFlags...)
@@ -334,6 +339,9 @@ type Copy struct {
 	metadataDirective     string
 	showProgress          bool
 	progressbar           progressbar.ProgressBar
+	checkFirst            bool
+	// set when the check-first plan already compared the destination: transfer tasks skip their own check
+	overrideChecked bool
 
 	// patterns
 	excludePatterns []*regexp.Regexp
@@ -414,6 +422,7 @@ func NewCopy(c *cli.Context, deleteSource bool) (*Copy, error) {
 		metadataDirective:     c.String("metadata-directive"),
 		showProgress:          c.Bool("show-progress") || c.Bool("progress-json"),
 		progressbar:           commandProgressBar,
+		checkFirst:            c.Bool("check-first"),
 
 		// region settings
 		srcRegion: c.String("source-region"),
@@ -495,6 +504,13 @@ func (c Copy) Run(ctx context.Context) error {
 		return err
 	}
 
+	// --check-first applies to uploads and downloads: list everything, compare in bulk, then transfer.
+	checkFirst := c.checkFirst && c.src.IsRemote() != c.dst.IsRemote()
+	var planned []*storage.Object
+	if checkFirst {
+		progressbar.SetPhase(c.progressbar, "listing")
+	}
+
 	for object := range objch {
 		if errorpkg.IsCancelation(object.Err) || object.Type.IsDir() {
 			continue
@@ -531,8 +547,6 @@ func (c Copy) Run(ctx context.Context) error {
 		}
 
 		srcurl := object.URL
-		var task parallel.Task
-
 		if object.Size == 0 && !(srcurl.Type == c.dst.Type) {
 			obj, err := client.Stat(ctx, srcurl)
 			if err == nil {
@@ -541,38 +555,34 @@ func (c Copy) Run(ctx context.Context) error {
 		}
 		c.progressbar.AddTotalBytes(object.Size)
 		c.progressbar.IncrementTotalObjects()
-
-		switch {
-		case srcurl.Type == c.dst.Type: // local->local or remote->remote
-			if c.metadataDirective == "" {
-				// default to COPY
-				c.metadataDirective = metadataDirectiveCopy
-				if c.src.IsRemote() && c.dst.IsRemote() {
-					// default to REPLACE when copying between remote storages
-					c.metadataDirective = metadataDirectiveReplace
-				}
-			}
-			task = c.prepareCopyTask(ctx, srcurl, c.dst, isBatch, c.metadata)
-		case srcurl.IsRemote(): // remote->local
-			if c.metadataDirective != "" {
-				err := fmt.Errorf("metadata directive is not supported for download")
-				merrorObjects = multierror.Append(merrorObjects, err)
-				printError(c.fullCommand, c.op, err)
-				continue
-			}
-			task = c.prepareDownloadTask(ctx, srcurl, c.dst, isBatch)
-		case c.dst.IsRemote(): // local->remote
-			if c.metadataDirective != "" {
-				err := fmt.Errorf("metadata directive is not supported for upload")
-				merrorObjects = multierror.Append(merrorObjects, err)
-				printError(c.fullCommand, c.op, err)
-				continue
-			}
-			task = c.prepareUploadTask(ctx, srcurl, c.dst, isBatch, c.metadata)
-		default:
-			panic("unexpected src-dst pair")
+		if checkFirst {
+			planned = append(planned, object)
+			continue
+		}
+		task, err := c.newCopyTask(ctx, object, isBatch)
+		if err != nil {
+			merrorObjects = multierror.Append(merrorObjects, err)
+			printError(c.fullCommand, c.op, err)
+			continue
 		}
 		parallel.Run(task, waiter)
+	}
+
+	if checkFirst {
+		send, ok := c.planCopy(ctx, planned, isBatch)
+		c.overrideChecked = ok
+		progressbar.PlanDone(c.progressbar)
+		progressbar.ListingDone(c.progressbar) // the plan is final before the first byte is sent
+		progressbar.SetPhase(c.progressbar, "transferring")
+		for _, object := range send {
+			task, err := c.newCopyTask(ctx, object, isBatch)
+			if err != nil {
+				merrorObjects = multierror.Append(merrorObjects, err)
+				printError(c.fullCommand, c.op, err)
+				continue
+			}
+			parallel.Run(task, waiter)
+		}
 	}
 	progressbar.ListingDone(c.progressbar) // all sources enumerated: totals are final
 	waiter.Wait()
@@ -584,6 +594,40 @@ func (c Copy) Run(ctx context.Context) error {
 		storage.ClearStateCompleted(c.storageOpts.StateFile)
 	}
 	return err
+}
+
+// newCopyTask builds the transfer task for one listed object (shared by the streaming and check-first
+// paths). A pointer receiver: the default metadata directive it sets must stick for later objects.
+func (c *Copy) newCopyTask(ctx context.Context, object *storage.Object, isBatch bool) (parallel.Task, error) {
+	srcurl := object.URL
+	var task parallel.Task
+	switch {
+	case srcurl.Type == c.dst.Type: // local->local or remote->remote
+		if c.metadataDirective == "" {
+			// default to COPY
+			c.metadataDirective = metadataDirectiveCopy
+			if c.src.IsRemote() && c.dst.IsRemote() {
+				// default to REPLACE when copying between remote storages
+				c.metadataDirective = metadataDirectiveReplace
+			}
+		}
+		task = c.prepareCopyTask(ctx, srcurl, c.dst, isBatch, c.metadata)
+	case srcurl.IsRemote(): // remote->local
+		if c.metadataDirective != "" {
+			err := fmt.Errorf("metadata directive is not supported for download")
+			return nil, err
+		}
+		task = c.prepareDownloadTask(ctx, srcurl, c.dst, isBatch)
+	case c.dst.IsRemote(): // local->remote
+		if c.metadataDirective != "" {
+			err := fmt.Errorf("metadata directive is not supported for upload")
+			return nil, err
+		}
+		task = c.prepareUploadTask(ctx, srcurl, c.dst, isBatch, c.metadata)
+	default:
+		panic("unexpected src-dst pair")
+	}
+	return task, nil
 }
 
 func (c Copy) prepareCopyTask(
@@ -680,7 +724,10 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 		}
 	}
 
-	err = c.shouldOverride(ctx, srcurl, dsturl)
+	err = nil
+	if !c.overrideChecked {
+		err = c.shouldOverride(ctx, srcurl, dsturl)
+	}
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
@@ -782,7 +829,10 @@ func (c Copy) doUpload(ctx context.Context, srcurl *url.URL, dsturl *url.URL, ex
 		}
 	}
 
-	err = c.shouldOverride(ctx, srcurl, dsturl)
+	err = nil
+	if !c.overrideChecked {
+		err = c.shouldOverride(ctx, srcurl, dsturl)
+	}
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
@@ -886,7 +936,10 @@ func (c Copy) doCopy(ctx context.Context, srcurl, dsturl *url.URL, extradata map
 		Directive:          c.metadataDirective,
 	}
 
-	err = c.shouldOverride(ctx, srcurl, dsturl)
+	err = nil
+	if !c.overrideChecked {
+		err = c.shouldOverride(ctx, srcurl, dsturl)
+	}
 	if err != nil {
 		if errorpkg.IsWarning(err) {
 			printDebug(c.op, err, srcurl, dsturl)
@@ -955,6 +1008,12 @@ func (c Copy) shouldOverride(ctx context.Context, srcurl *url.URL, dsturl *url.U
 		return err
 	}
 
+	return c.overrideDecision(srcObj, dstObj)
+}
+
+// overrideDecision: nil = transfer; a warning error = the destination already satisfies the copy flags
+// (-n, -s, -u). Shared by the per-object check and the check-first plan.
+func (c Copy) overrideDecision(srcObj, dstObj *storage.Object) error {
 	// if destination not exists, no conditions apply.
 	if dstObj == nil {
 		return nil
@@ -976,7 +1035,7 @@ func (c Copy) shouldOverride(ctx context.Context, srcurl *url.URL, dsturl *url.U
 	if c.ifSourceNewer {
 		srcMod, dstMod := srcObj.ModTime, dstObj.ModTime
 
-		if !srcMod.After(*dstMod) {
+		if srcMod != nil && dstMod != nil && !srcMod.After(*dstMod) {
 			stickyErr = errorpkg.ErrObjectIsNewer
 		} else {
 			stickyErr = nil
