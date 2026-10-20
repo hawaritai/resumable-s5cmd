@@ -171,3 +171,140 @@ func TestCopyCheckFirstUploadManyFiles(t *testing.T) {
 	assert.Equal(t, p.Plan.SendFiles, int64(50))
 	assert.Equal(t, p.Files, int64(100))
 }
+
+// cp --check-first -n -s file s3://bucket/prefix/: a single file, already there with the same size, is skipped.
+func TestCopyCheckFirstSingleFileUpload(t *testing.T) {
+	t.Parallel()
+	bucket := s3BucketFromTestName(t)
+	s3client, s5cmd := setup(t)
+	createBucket(t, s3client, bucket)
+	putFile(t, s3client, bucket, "p/one.txt", "1111")
+
+	workdir := fs.NewDir(t, t.Name(), fs.WithFile("one.txt", "2222"), fs.WithFile("two.txt", "22"))
+	defer workdir.Remove()
+
+	for _, tc := range []struct {
+		file string
+		plan checkFirstPlan
+	}{
+		{"one.txt", checkFirstPlan{SkipFiles: 1, SkipBytes: 4}},
+		{"two.txt", checkFirstPlan{SendFiles: 1, SendBytes: 2}},
+	} {
+		result := icmd.RunCmd(s5cmd("cp", "--check-first", "--progress-json", "-n", "-s", tc.file, "s3://"+bucket+"/p/"),
+			withWorkingDir(workdir))
+		result.Assert(t, icmd.Success)
+		assert.DeepEqual(t, *finalProgress(t, result.Stdout()).Plan, tc.plan)
+	}
+	assert.Assert(t, ensureS3Object(s3client, bucket, "p/one.txt", "1111"))
+	assert.Assert(t, ensureS3Object(s3client, bucket, "p/two.txt", "22"))
+}
+
+// cp --check-first -n -s s3://bucket/key dir/: a single object, already on this PC, is not downloaded again.
+func TestCopyCheckFirstSingleObjectDownload(t *testing.T) {
+	t.Parallel()
+	bucket := s3BucketFromTestName(t)
+	s3client, s5cmd := setup(t)
+	createBucket(t, s3client, bucket)
+	putFile(t, s3client, bucket, "p/one.txt", "1111")
+	putFile(t, s3client, bucket, "p/two.txt", "22")
+
+	workdir := fs.NewDir(t, t.Name(), fs.WithDir("out", fs.WithFile("one.txt", "AAAA")))
+	defer workdir.Remove()
+
+	for _, tc := range []struct {
+		key  string
+		plan checkFirstPlan
+	}{
+		{"p/one.txt", checkFirstPlan{SkipFiles: 1, SkipBytes: 4}},
+		{"p/two.txt", checkFirstPlan{SendFiles: 1, SendBytes: 2}},
+	} {
+		result := icmd.RunCmd(s5cmd("cp", "--check-first", "--progress-json", "-n", "-s", "s3://"+bucket+"/"+tc.key, "out/"),
+			withWorkingDir(workdir))
+		result.Assert(t, icmd.Success)
+		assert.DeepEqual(t, *finalProgress(t, result.Stdout()).Plan, tc.plan)
+	}
+	expected := fs.Expected(t, fs.WithDir("out", fs.WithFile("one.txt", "AAAA"), fs.WithFile("two.txt", "22")))
+	assert.Assert(t, fs.Equal(workdir.Path(), expected))
+}
+
+// A folder download into a folder that already holds part of it, in nested sub-folders: one walk finds them.
+func TestCopyCheckFirstDownloadNestedExisting(t *testing.T) {
+	t.Parallel()
+	bucket := s3BucketFromTestName(t)
+	s3client, s5cmd := setup(t)
+	createBucket(t, s3client, bucket)
+	for _, k := range []string{"d/a/1.bin", "d/a/b/2.bin", "d/a/b/c/3.bin", "d/x/4.bin"} {
+		putFile(t, s3client, bucket, k, "data")
+	}
+	workdir := fs.NewDir(t, t.Name(), fs.WithDir("out",
+		fs.WithDir("a", fs.WithFile("1.bin", "DATA"), fs.WithDir("b", fs.WithDir("c", fs.WithFile("3.bin", "DATA")))),
+		fs.WithFile("unrelated.txt", "zzz"),
+	))
+	defer workdir.Remove()
+
+	result := icmd.RunCmd(s5cmd("cp", "--check-first", "--progress-json", "-n", "-s", "s3://"+bucket+"/d/*", "out/"),
+		withWorkingDir(workdir))
+	result.Assert(t, icmd.Success)
+	assert.DeepEqual(t, *finalProgress(t, result.Stdout()).Plan, checkFirstPlan{SendFiles: 2, SendBytes: 8, SkipFiles: 2, SkipBytes: 8})
+	expected := fs.Expected(t, fs.WithDir("out",
+		fs.WithDir("a", fs.WithFile("1.bin", "DATA"), fs.WithDir("b", fs.WithFile("2.bin", "data"),
+			fs.WithDir("c", fs.WithFile("3.bin", "DATA")))),
+		fs.WithDir("x", fs.WithFile("4.bin", "data")),
+		fs.WithFile("unrelated.txt", "zzz"),
+	))
+	assert.Assert(t, fs.Equal(workdir.Path(), expected))
+}
+
+// Re-running a finished copy sends nothing: everything is in the plan as already there.
+func TestCopyCheckFirstRerunSendsNothing(t *testing.T) {
+	t.Parallel()
+	bucket := s3BucketFromTestName(t)
+	s3client, s5cmd := setup(t)
+	createBucket(t, s3client, bucket)
+	workdir := fs.NewDir(t, t.Name(), fs.WithDir("dir", fs.WithFile("a.txt", "aa"), fs.WithDir("s", fs.WithFile("b.txt", "bbb"))))
+	defer workdir.Remove()
+
+	up := func() checkFirstProgress {
+		r := icmd.RunCmd(s5cmd("cp", "--check-first", "--progress-json", "-n", "-s", "dir", "s3://"+bucket+"/"), withWorkingDir(workdir))
+		r.Assert(t, icmd.Success)
+		return finalProgress(t, r.Stdout())
+	}
+	assert.DeepEqual(t, *up().Plan, checkFirstPlan{SendFiles: 2, SendBytes: 5})
+	second := up()
+	assert.DeepEqual(t, *second.Plan, checkFirstPlan{SkipFiles: 2, SkipBytes: 5})
+	assert.Equal(t, second.Transferred, int64(0))
+
+	down := func() checkFirstProgress {
+		r := icmd.RunCmd(s5cmd("cp", "--check-first", "--progress-json", "-n", "-s", "s3://"+bucket+"/dir/*", "back/"), withWorkingDir(workdir))
+		r.Assert(t, icmd.Success)
+		return finalProgress(t, r.Stdout())
+	}
+	assert.DeepEqual(t, *down().Plan, checkFirstPlan{SendFiles: 2, SendBytes: 5})
+	assert.DeepEqual(t, *down().Plan, checkFirstPlan{SkipFiles: 2, SkipBytes: 5})
+}
+
+// The app always runs with a checkpoint (--state-file): check-first and resume work together.
+func TestCopyCheckFirstWithStateFile(t *testing.T) {
+	t.Parallel()
+	bucket := s3BucketFromTestName(t)
+	s3client, s5cmd := setup(t)
+	createBucket(t, s3client, bucket)
+	putFile(t, s3client, bucket, "dir/old.txt", "OLD!")
+	workdir := fs.NewDir(t, t.Name(),
+		fs.WithDir("dir", fs.WithFile("old.txt", "old!"), fs.WithFile("new.txt", "new file")),
+	)
+	defer workdir.Remove()
+	state := workdir.Join("job_state.json")
+
+	run := func(args ...string) checkFirstProgress {
+		base := []string{"cp", "--check-first", "--progress-json", "--state-file", state, "-n", "-s"}
+		r := icmd.RunCmd(s5cmd(append(base, args...)...), withWorkingDir(workdir))
+		r.Assert(t, icmd.Success)
+		return finalProgress(t, r.Stdout())
+	}
+	assert.DeepEqual(t, *run("dir", "s3://"+bucket+"/").Plan, checkFirstPlan{SendFiles: 1, SendBytes: 8, SkipFiles: 1, SkipBytes: 4})
+	assert.Assert(t, ensureS3Object(s3client, bucket, "dir/new.txt", "new file"))
+	p := run("s3://"+bucket+"/dir/*", "back/")
+	assert.DeepEqual(t, *p.Plan, checkFirstPlan{SendFiles: 2, SendBytes: 12})
+	assert.Equal(t, p.Files, int64(2))
+}
